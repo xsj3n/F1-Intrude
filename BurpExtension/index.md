@@ -1,0 +1,1 @@
+- [x] BurpSuite Extension to fetch the request to fuzz
