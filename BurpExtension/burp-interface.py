@@ -2,6 +2,7 @@
 Created on Oct 22, 2023
 
 Intended intepreter: Jython 2.7 standalone jar
+API Document source: https://portswigger.github.io/burp-extensions-montoya-api/javadoc/index.html
 
 @author: xis31
 '''
