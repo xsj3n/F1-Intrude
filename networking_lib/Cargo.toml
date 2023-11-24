@@ -1,0 +1,18 @@
+[package]
+name = "netcom"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "netcom"
+crate-type = ["cdylib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+url = { version = "2", features = ["serde"] }
+webpki-roots = "0.25.2"
+libc = "0.2.150"
+native-tls = "0.2.11"
+once_cell = "1.18.0"
+unicode-segmentation = "1.10.1"
