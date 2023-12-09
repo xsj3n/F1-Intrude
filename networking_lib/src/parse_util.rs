@@ -1,14 +1,22 @@
-use std::{fs, str::{from_utf8, from_boxed_utf8_unchecked}, num::IntErrorKind, error::Error, path, slice::from_raw_parts};
+use std::{num::IntErrorKind, slice::from_raw_parts, str::from_boxed_utf8_unchecked};
 use unicode_segmentation::UnicodeSegmentation;
-use url::*;
 use libc::strlen;
 
-#[path = "err.rs"]
-mod err;
-use self::err::CacheReadError;
 
+pub struct CacheReadError
+{
+    pub details: String
+}
 
-pub struct URI_COMPONENTS
+impl CacheReadError
+{
+    pub fn new(msg: &str) -> CacheReadError
+    {
+        CacheReadError { details: msg.to_string()}
+    }
+}
+
+pub struct URICOMPONENTS
 {
     pub scheme: String,
     pub host: String,
@@ -16,12 +24,12 @@ pub struct URI_COMPONENTS
     pub path: String,
     pub query: Option<String>,
 }
-
-pub fn parse_uri(full_uri: String) -> URI_COMPONENTS
+/* 
+pub fn parse_uri(full_uri: String) -> URICOMPONENTS
 {
     let uri_comps = Url::parse(&full_uri).unwrap();
     
-    return URI_COMPONENTS
+    return URICOMPONENTS
     {
         scheme: uri_comps.scheme().to_string(),
         host: uri_comps.host().unwrap().to_string(),
@@ -40,6 +48,7 @@ pub fn parse_uri(full_uri: String) -> URI_COMPONENTS
     };
 
 }
+*/
 
 pub fn parse_host_from_cache_data(request_string: String) -> Result<String, CacheReadError>
 {
@@ -62,10 +71,10 @@ pub fn parse_host_from_cache_data(request_string: String) -> Result<String, Cach
 pub fn parse_burp_file() -> Result<String, CacheReadError>
 {
 
-    let req_byte_string = match fs::read_to_string("/Users/xis31/tmp/req_cache.dat")
+    let req_byte_string = match std::fs::read_to_string("/Users/xis31/tmp/req_cache.dat")
     {
       Ok(s) => s, 
-      Err(e) => 
+      Err(_) => 
       {
         // LOG HERE
         return Err(CacheReadError::new("[!] Unable to read cache file"));
@@ -104,10 +113,11 @@ pub fn parse_burp_file() -> Result<String, CacheReadError>
 
 }
 
-pub fn __permutate_request__(perm_string: String) -> String
+pub fn __permutate_request__(perm_string: &str) -> String
 {
-    let mut buf = (String::new(), false);
     let grp = perm_string.graphemes(true);
+
+    let mut buf = (String::new(), false);
     for g in grp
     { 
         if g == "†"

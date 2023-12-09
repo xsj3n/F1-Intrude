@@ -1,98 +1,167 @@
-use core::panic;
-use std::{ffi::{CStr, CString, c_char}, ptr, str::{from_utf8, from_boxed_utf8_unchecked}};
-use std::sync::Mutex;
-use err::{CResult, FFI_STRING_ERROR_C};
-use ffi::from_c_string;
-use libc::strlen;
-use net_spx::{__start_com_cycle__, TlsClient, __send_comm__};
-use parse_util::__permutate_request__;
+use libc::c_char;
+use std::ffi::CString;
+use std::cell::RefCell;
+use crate::ffi::*;
 
-
-
+use crate::net_spx::*;
+use crate::parse_util::__permutate_request__;
 mod net_spx;
 mod parse_util;
 mod err;
 mod ffi;
+type BOOL = u8;
 
-/*
-Error handling: 
-*/
-macro_rules! ret2c {
-    ($type:ident) => 
-    {
-        Box::into_raw(Box::new($type))
-    };
+#[derive(PartialEq)]
+#[derive(Copy, Clone)]
+enum STATE 
+{
+    UNINIT,
+    INIT,
+    //LOCKED,
+    READY
 }
 
-static mut TLS_CLIENT: Option<TlsClient> = None;
-static mut RequestCache: String = String::new();
+thread_local! {static STATE_T: RefCell<STATE> = RefCell::new(STATE::UNINIT);}
+static mut TLS_CLIENT: Option<net_spx::TlsClient> = None;
+
+
+
+/*
+ */
+#[no_mangle]
+pub extern "C" fn start_com_cycle() -> BOOL
+{
+    if get_state() != STATE::UNINIT
+    {
+        return 0;
+    }
+
+    match __start_com_cycle__()
+    {
+        Ok(tc) => unsafe {TLS_CLIENT = Some(tc)},
+        Err(_) => return 0
+    };
+
+    set_state(STATE::INIT);
+
+    return 1;
+
+}
+
+
 
 // This function will have to be called first
 // This will pass the request to the gui for editing, and init the buffer which will be used as a cache to lessen passing accross ffi
 #[no_mangle]
-pub extern "C" fn ParseBurpRequestCache() -> *mut CString
+pub extern "C" fn ParseBurpRequestCache() -> Option<*mut c_char>
 {
+
+    if get_state() != STATE::INIT
+    {
+        return None;
+    }    
+
+    let empty: [char; 0] = [];
     let rust_string = match parse_util::parse_burp_file()
     {
         Ok(s) => s,
-        Err(_) => return ptr::null_mut()
+        Err(_) => return None
     };
 
-
-
-    let c_str = match CString::new(rust_string)
-    {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut()
-    };
-
-    return ret2c!(c_str);
+    
+    set_state(STATE::READY);
+    return pass_to_c(&rust_string);
 
 }
 
-
-// iterate over permutations 
-#[no_mangle]
-pub extern "C" fn StartCOMCycle() -> CResult
-{
-    match __start_com_cycle__()
-    {
-        Ok(tc) => unsafe {TLS_CLIENT = Some(tc)},
-        Err(e) => return CResult::new(true, e).unwrap()
-    };
-
-    return CResult::new(false, String::new()).unwrap();
-
-}
 
 #[no_mangle]
-pub extern "C" fn send_com(request_s: *const c_char) -> CResult
+pub extern "C" fn permutate_request(perm_string_ptr:*const c_char,) -> Option<*mut c_char>
 {
+    let perm_string = read_immut_string_from_c(perm_string_ptr);
+    let mod_string = __permutate_request__(&perm_string);
 
-    let reques_rs_s: String = match  unsafe { from_c_string(request_s) }
+    return pass_to_c(&mod_string);
+}
+
+
+
+/*
+PARAM 1: Request String from C
+RETURN: Returns null-able pointer to a struct containing infromation returned from http request 
+DESTRUCT FUNC: rdealloc_http_response_data
+ */
+#[no_mangle]
+pub extern "C" fn send_com(request_s: *const c_char) -> Option<*mut HttpResponseDataC>
+{
+    if get_state() != STATE::READY
     {
-        Ok(s) => s,
-        Err(_) => return CResult::new(true, FFI_STRING_ERROR_C).unwrap()
+        return None;
+    }
+
+    let reques_rs_s: String = read_immut_string_from_c(request_s);
+    let response =  unsafe { __send_comm__ (&mut TLS_CLIENT.as_mut().unwrap(),reques_rs_s)};
+
+    match response 
+    {
+        Ok(hrdc) => return Some(Box::into_raw(Box::new(hrdc))),
+        Err(_) => return None
     };
 
 
-    let response = __send_comm__ (unsafe { &mut TLS_CLIENT.unwrap()} , reques_rs_s);
 }
+
+
+
+
+    
+
+
+
+// ======destruct
 
 #[no_mangle]
-pub extern "C" fn permutate_request(perm:*const c_char,) -> CResult
+pub extern "C" fn rdealloc_string(string: *mut c_char) -> ()
 {
-    let perm_string = match unsafe { from_c_string(perm) }
-    {
-        Ok(s) => s,
-        Err(_) => return CResult::new(true, FFI_STRING_ERROR_C).unwrap()
-    };
-
-
-    return CResult::new(false, __permutate_request__(perm_string)).unwrap();
+    unsafe{ CString::from_raw(string) };
 }
 
+
+#[no_mangle]
+pub extern "C" fn rdealloc_http_response_data(obj: *mut HttpResponseDataC) -> ()
+{
+    unsafe { Box::from_raw(obj); } 
+}
+
+// ======STATE
+fn get_state() -> STATE
+{
+    let st: STATE = STATE_T.with(|state: &RefCell<STATE> | 
+        {
+            *state.borrow()
+        });
+
+    return st;
+}
+
+fn set_state(state_set: STATE) -> ()
+{
+    STATE_T.with(|state: &RefCell<STATE> | 
+        {
+            *state.borrow_mut() = state_set;
+        });
+
+}
 /*
 June 1, 172; first surviving instance of megistou kai megistou
 theou megalou Hermou
+
+API USAGE ORDER:
+1. Init tls client: start_com_cycle
+1. Parase burp file
+2. SEND REQUEST - send_com 
+2. PERMUTATE REQUEST - permutate_request
+3. INIT - start_com_cycle 
+
+
 */
