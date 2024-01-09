@@ -3,7 +3,7 @@ use std::{sync::Arc, cell::RefCell};
 
 use futures::future::join_all;
 use rustls::{RootCertStore, ClientConfig};
-use tokio::{net::{TcpStream, tcp}, io::{AsyncWriteExt, AsyncReadExt}};
+use tokio::{net::{TcpStream, tcp}, io::{AsyncWriteExt, AsyncReadExt}, sync::Mutex};
 use tokio::task::JoinHandle;
 use crate::{Callback, net_spx::{ResponseString, HTTPResult}, ffi::{HttpResponseDataC, RequestandPermutation}, log::dbg_log_progress, DOMAIN_BUF};
 
@@ -16,154 +16,125 @@ struct WorkerLoad
     remainder: u32
 }
 
-pub async fn start_taskmaster(domain: String, request_perumation_buffer: RequestandPermutation, cb: Callback)
+enum HttpStatus 
 {
-
-
-    let wrk_load = derive_WorkerLoad(request_perumation_buffer.request.len(), 100).await;
-    let mut tasks = calc_tasks_per_worker(request_perumation_buffer, &wrk_load).await;
-
-    let mut log_s = format!("[*] ===Starting Taskmaster:\nWorkers: {}  Tasks-per-worker:  {}  Total Permuations: {} Host: {}", wrk_load.work_grp_num, wrk_load.tasks_per, tasks.len(), &domain);
-    dbg_log_progress(&log_s);
-    
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(
-        webpki_roots::TLS_SERVER_ROOTS
-            .iter()
-            .cloned()
-    );
-
-    let mut j_v: Vec<JoinHandle<()>> = Vec::new();
-    let len = tasks.len();
-
-    for x in 0..len
-    {
-        let root_clone = root_store.clone();
-        let domain_str_clone    = domain.clone();
-        let task_ref = tasks.remove(0);
-
-        log_s = format!("[*] ===Spawning worker {} on target domain {}...", x, &domain);
-        dbg_log_progress(&log_s);
-        
-        let j = tokio::spawn( async move { start_worker(domain_str_clone, task_ref, root_clone,  cb.clone()).await; });
-        j_v.push(j);
-    }
-
-    join_all(j_v).await;
-
-
-
+    FullyConstructedHeaderOnly,
+    FullyConstructed,
+    NotDone
 }
 
-thread_local!{ static ROW_LEVEL: Arc<RefCell<u16>> = Arc::new(RefCell::new(0)); }
-async fn start_worker(d_s: String, request_perumation_buffer: RequestandPermutation, root_store: RootCertStore, cb: Callback) -> ()
+async fn start_worker(d_s: String, request_perumation_buffer: RequestandPermutation, root_store: RootCertStore, acc_v: Arc<Mutex<Vec<String>>>) -> ()
 {
-
     
-
-
-    let tcp_stream = match TcpStream::connect(d_s.clone() + ":443").await
-    {
-        Ok(t) => t,
-        Err(_) => 
+    // this just lets jus boot our connection back up if we get our connection closed on us
+    // this can happen if the server returns a 404 and insta-closes 
+    let mut straggler_kq_v: Vec<JoinHandle<()>> = Vec::new();
+    let mut resume = 0; // -1 as it will be used for indexing
+    'worker_start: loop {
+        let tcp_stream = match TcpStream::connect(d_s.clone() + ":443").await
         {
-
-            let dbg_s = "[!] Worker unable to connect to ".to_string() + &d_s + ":443";
-            dbg_log_progress(&dbg_s);
-            return;
-        }
-    };
-
-    println!("===Starting Worker...");
-    let client_config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let conn = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-
-
-    let mut t = match conn.connect(d_s.clone().try_into().unwrap(), tcp_stream).await
-    {
-        Ok(t) => t,
-        Err(_) => 
-        {
-            let dbg_s = "[!] Worker unable to connect to ".to_string() + &d_s;
-            dbg_log_progress(&dbg_s);
-            return;
-        }
-    };
-
-   let mut i = 0;
-    for rs in &request_perumation_buffer.request
-    {
-        t.write_all(rs.as_bytes()).await.unwrap();
-        t.flush().await.unwrap();
-
-        let mut b: Vec<u8> = Vec::new();
-        let mut rd_buf = [0u8; 1024];
-        
-        loop 
-        {
-            let _bytes_read = t.read(&mut rd_buf[..]).await.unwrap();
-            b.extend_from_slice(&rd_buf);
-            
-            let s = String::from_utf8_lossy(&b).to_string();
- 
-            match find_if_body(&s).await
+            Ok(t) => t,
+            Err(_) => 
             {
-                ReadStatus::READ_AGAIN =>
-                {
-                    continue;
-                },
-                ReadStatus::DONE =>
-                {
-                    break;
-                }
-            };         
-        }   
-
-        let log_s = format!("[*] ===Worker received a response:\n{}", String::from_utf8_lossy(&b));
-        dbg_log_progress(&log_s);
-        
-        i += 1;
-        let final_response =  ResponseString(
-            String::from_utf8_lossy(&b).to_string()
-            ).parse_response();
-
-        let _ = match cb 
-        {
-            Some(f) => 
-            {
-                match final_response
-                {
-                    Ok(hrdc)     => f(
-                        hrdc, 
-                        request_perumation_buffer.permutation[i].clone(), 
-                        access_and_increment_rowlevel()),
-
-                    Err(HTTPResult::TLS_READ_ERROR) => f(
-                        HttpResponseDataC::new((None, None), 0, "[!] TLS Error".to_string()),
-                        request_perumation_buffer.permutation[i].clone(),
-                        access_and_increment_rowlevel()
-                    ),
-
-                    Err(_)                          => f(
-                        HttpResponseDataC::new((None, None), 0, String::new()),
-                        request_perumation_buffer.permutation[i].clone(),
-                        access_and_increment_rowlevel())  
-                }
-            },
-            None => panic!("===========NO CALLBACK PASSED=============")
+    
+                return;
+            }
         };
+        tcp_stream.set_nodelay(true).unwrap();
+    
+        println!("===Starting Worker...");
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+    
+        let conn = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    
+    
+        let mut t = match conn.connect(d_s.clone().try_into().unwrap(), tcp_stream).await
+        {
+            Ok(t) => t,
+            Err(_) => 
+            {
+                let dbg_s = "[!] Worker unable to connect to ".to_string() + &d_s;
+                println!("{}", &dbg_s);
+                return;
+    
+                
+            }
+        };
+        
+        
+        'out: for rs in &request_perumation_buffer.request[resume..]
+        {
+            if resume == request_perumation_buffer.request.len()
+            {
+                return;
+            }
+            t.write_all(rs.as_bytes()).await.unwrap();
+            //println!("Written:\n{}", &rs);
+            t.flush().await.unwrap();
+            
+    
+            let mut b: Vec<u8> = Vec::new();
+            let mut rd_buf = [0u8; 4096];
+            
+            loop 
+            {
+                
 
-        return;
-
+                // failing to avoid this read when there is nothing left, is e v e r y thing
+                let _bytes_read = t.read(&mut rd_buf[..]).await.unwrap();
+                if _bytes_read == 0 
+                { 
+                    println!("Bytes read: {}", _bytes_read);
+                    straggler_kq_v.push(kq_straggler(d_s.clone(), &rs, root_store.clone(), acc_v.clone()));
+                    resume += 1;
+                    continue 'worker_start;
+                } // TODO: we would log a failure
+                b.extend_from_slice(&rd_buf[.._bytes_read]);
+           
+                
+               match chk_if_http_is_done(&b).await
+               {
+                    HttpStatus::FullyConstructed => 
+                    {
+                        let fin = String::from_utf8_lossy(&b)
+                            .to_string();
+                        //println!("Valid:\n{}", &fin);
+                        resume += 1;
+                        acc_v.lock().await.push(fin);
+                        continue 'out;
+                    }
+    
+                    HttpStatus::FullyConstructedHeaderOnly =>
+                    {
+                        let fin = String::from_utf8_lossy(&b)
+                            .to_string();
+                        //println!("Valid:\n{}", &fin);
+                        acc_v.lock().await.push(fin);
+                        resume += 1;
+                        continue 'out;
+                    }
+                    
+                    HttpStatus::NotDone => continue
+               }
+     
+               
+            }   
+    
+            
+            
+    
+        }
+        break;
     }
-
+    join_all(straggler_kq_v).await; 
+    return;
 }
 
-fn access_and_increment_rowlevel() -> u16
+fn access_and_increment_rowlevel() -> ()//u16
 {
+    /* 
     let row = ROW_LEVEL.with(|i: &Arc<RefCell<u16>>|
         {
             *i.borrow_mut() += 1;
@@ -172,127 +143,107 @@ fn access_and_increment_rowlevel() -> u16
         });
 
     return row;
+    */
 }
 
 
-async fn derive_WorkerLoad(num: usize, requests_per_thread: usize) -> WorkerLoad
+#[inline(always)]
+// perhaps CL can represenrt the bytes left to read
+async fn chk_if_http_is_done(accum: &[u8]) -> HttpStatus
 {
 
-    let wrk: WorkerLoad = match num > 100
-    {
-        true =>
-        {
-            let worker_group_number = num / requests_per_thread;
-            if num % 100 == 0
-            {
-                let (worker_group_number, tasks_per_worker): (usize, usize) = (worker_group_number, num / worker_group_number);
-                WorkerLoad
-                {
-                    work_grp_num: worker_group_number as u32,
-                    tasks_per: tasks_per_worker as u32,
-                    remainder: 0
-                }
-                
-            } else
-            {
-                let (worker_group_number, tasks_per_worker): (usize, usize) = (worker_group_number, num / worker_group_number);
-                let remaining_tasks_to_be_distributed = num - (worker_group_number * tasks_per_worker);
-                let  w = WorkerLoad
-                {
-                    work_grp_num: worker_group_number as u32,
-                    tasks_per: tasks_per_worker as u32,
-                    remainder: remaining_tasks_to_be_distributed as u32
-                };
-                w
 
-            }
-            
-        }
-        false =>
-        {   
-            WorkerLoad
+    let response = String::from_utf8_lossy(&accum).to_string();
+    let target_len  = chk_content_length(&accum).await;
+    let current_len = determine_body_sz_in_accum(&accum).await;
+
+    //println!("{} out of {} body bytes read!", current_len, target_len);
+
+    if response.len() != 0 
+    {
+        //assert!(response.contains("HTTP/1.1"));
+    }
+
+
+    if response.contains("\r\n\r\n") && !response.contains("Content-Length") && !response.contains("content-length")
+    {
+        //println!("Valid-HO:\n{}", response);
+        return HttpStatus::FullyConstructedHeaderOnly; // No body, message end 
+        
+    }
+
+    if response.contains("\r\n\r\n") && target_len <= current_len
+    {
+        //println!("Valid:\n{}", response);
+        return HttpStatus::FullyConstructed;
+    }
+
+    return HttpStatus::NotDone; // Incomplete response, read more;
+}
+
+#[inline(always)]
+async fn chk_content_length(accum: &[u8]) -> isize
+{
+    let response = String::from_utf8_lossy(&accum).to_string();
+    let lines = response.split("\r\n");
+    for l in lines
+    {
+        if response.contains("HTTP/1.1") &&
+        (l.contains("Content-Length") || l.contains("content-length")) && response.contains("\r\n\r\n") 
+        {
+            let body_len = if l.contains("Content-Length") 
             {
-                work_grp_num: 1,
-                tasks_per: num as u32,
-                remainder: 0
-            }
+                l.replace("Content-Length: ", "").trim()
+                    .parse::<isize>().unwrap()
+            } else 
+            {
+                l.replace("content-length: ", "").trim()
+                    .parse::<isize>().unwrap()
+            };     
+            return body_len as isize; // there is a body, and it is next
         }
+    }
+
+    if response.contains("HTTP/1.1") && response.contains("\r\n\r\n")
+    {
+        return 0; // Response done, only the header
+    }
+
+    return -1; // return -1 when not even the full http header has been received 
+}
+
+
+#[inline(always)]
+async fn determine_body_sz_in_accum(accum: &[u8]) -> isize
+{
+    let response = String::from_utf8_lossy(&accum).to_string();
+    let sub_strs = response.split("\r\n\r\n");
+
+    for half in sub_strs
+    {
+        
+        if !half.contains("HTTP/1.1") && !half.is_empty()
+        {
+            return half.len().try_into().unwrap();
+        }
+        
+    }
+
+    return 0; //failure or headers only
+}
+
+
+fn kq_straggler(d_s: String,rs: &str, root_store: RootCertStore, acc_v: Arc<Mutex<Vec<String>>>) -> JoinHandle<()>
+{
+    let r = RequestandPermutation
+    {
+        request: vec![rs.to_string(); 1],
+        permutation: vec!["perm".to_string(); 1]
     };
 
-    return wrk;
-    
-}
-
-
-async fn calc_tasks_per_worker(bulk: RequestandPermutation, wrk_load: &WorkerLoad) -> Vec<RequestandPermutation>
-{
-    let mut i = 1;
-    let mut bot_cap = 0;
-    let mut tasks: Vec<RequestandPermutation> = Vec::new();
-    loop
-    {
-        let mut cap: usize = (wrk_load.tasks_per * i) as usize;
-         
-        let r_slice = bulk.request[bot_cap..cap].to_vec();
-        let p_slice = bulk.permutation[bot_cap..cap].to_vec();
-
-        tasks.push(RequestandPermutation { request: r_slice, permutation: p_slice });
-
-        bot_cap = cap;
-        cap += wrk_load.tasks_per as usize;
-        
-        i += 1;
-        if i == wrk_load.work_grp_num + 1
+    println!("Spawning KQ Task due to connection closed>>>>");
+    return tokio::spawn(async move 
         {
-           return tasks;
-        }
-        
-    }
-
-}
-
-enum ReadStatus
-{
-    DONE,
-    READ_AGAIN
-}
-async fn find_if_body(s: &str) -> ReadStatus
-{
-    if !s.contains("Content-Length:")
-    {
-        return ReadStatus::DONE;
-
-    } else if s.contains("\r\n\r\n")
-    {
-        let index = s.find("\r\n\r\n").unwrap();
-        let body = &s[index + 4..];
-
-        if body.len() <= 2
-        {
-            return ReadStatus::READ_AGAIN;
-
-        } else
-        {
-            return ReadStatus::DONE;  
-        }
-        
-    } else if s.contains("\n\n")
-    {
-        let index = s.find("\n\n").unwrap();
-        let body = &s[index + 2..];
-        
-        if body.len() <= 2
-        {
-            return ReadStatus::READ_AGAIN; 
-
-        } else
-        {
-            // stop reading
-            return ReadStatus::DONE; 
-        }
-    } else
-    {
-        // Log un-conclusive request 
-        return ReadStatus::DONE;
-    }
+            start_worker(d_s, r, root_store, acc_v).await;
+        });
 }
